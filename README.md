@@ -4,5 +4,7 @@ Software Development Tools
 
 Starter webpage for the independent homework assignment on branches, pull requests, merging, and merge conflicts. Follow the requirements in Canvas.
 
-Favorite Git Command: git rebase
+
+Favorite Git Command: git bisect
+
 
