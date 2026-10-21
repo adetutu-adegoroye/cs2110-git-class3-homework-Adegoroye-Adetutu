@@ -1,0 +1,82 @@
+name: Move linked issues to In Review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  move-issues:
+    # Skip drafts; they run later via "ready_for_review"
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move linked issues
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROJECT_NUMBER: 3      
+          STATUS_NAME: "In Review"
+        run: |
+          # 1. Find issues linked to this PR
+          ISSUES=$(gh api graphql -f query='
+            query($owner:String!, $repo:String!, $pr:Int!) {
+              repository(owner:$owner, name:$repo) {
+                pullRequest(number:$pr) {
+                  closingIssuesReferences(first:50) { nodes { id number } }
+                }
+              }
+            }' -f owner="$OWNER" -f repo="$REPO" -F pr="$PR_NUMBER" \
+            --jq '.data.repository.pullRequest.closingIssuesReferences.nodes')
+
+          if [ "$(echo "$ISSUES" | jq length)" -eq 0 ]; then
+            echo "No linked issues. Nothing to do."; exit 0
+          fi
+
+          # 2. Look up the Project ID, Status field ID, and "In Review" option ID
+          #    (for an organization project, change user(login:) to organization(login:))
+          INFO=$(gh api graphql -f query='
+            query($owner:String!, $num:Int!) {
+              user(login:$owner) {
+                projectV2(number:$num) {
+                  id
+                  field(name:"Status") {
+                    ... on ProjectV2SingleSelectField { id options { id name } }
+                  }
+                }
+              }
+            }' -f owner="$OWNER" -F num="$PROJECT_NUMBER")
+
+          PROJECT_ID=$(echo "$INFO" | jq -r '.data.user.projectV2.id')
+          FIELD_ID=$(echo "$INFO" | jq -r '.data.user.projectV2.field.id')
+          OPTION_ID=$(echo "$INFO" | jq -r --arg n "$STATUS_NAME" \
+            '.data.user.projectV2.field.options[] | select(.name==$n) | .id')
+
+          if [ -z "$OPTION_ID" ]; then echo "Status '$STATUS_NAME' not found"; exit 1; fi
+
+          # 3. For each issue: add it to the Project (harmless if already there), then set Status
+          echo "$ISSUES" | jq -c '.[]' | while read -r issue; do
+            ISSUE_ID=$(echo "$issue" | jq -r '.id')
+            NUM=$(echo "$issue" | jq -r '.number')
+
+            ITEM_ID=$(gh api graphql -f query='
+              mutation($p:ID!, $c:ID!) {
+                addProjectV2ItemById(input:{projectId:$p, contentId:$c}) { item { id } }
+              }' -f p="$PROJECT_ID" -f c="$ISSUE_ID" \
+              --jq '.data.addProjectV2ItemById.item.id')
+
+            gh api graphql -f query='
+              mutation($p:ID!, $i:ID!, $f:ID!, $o:String!) {
+                updateProjectV2ItemFieldValue(input:{
+                  projectId:$p, itemId:$i, fieldId:$f,
+                  value:{ singleSelectOptionId:$o }
+                }) { projectV2Item { id } }
+              }' -f p="$PROJECT_ID" -f i="$ITEM_ID" -f f="$FIELD_ID" -f o="$OPTION_ID"
+
+            echo "Moved issue #$NUM to $STATUS_NAME"
+          done
