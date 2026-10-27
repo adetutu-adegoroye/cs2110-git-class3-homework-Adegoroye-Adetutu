@@ -1,0 +1,95 @@
+name: Move linked issues to In Review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  move-issues:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PROJECT_OWNER: ADEGOROYE-ADETUTU
+          PROJECT_NUMBER: "3"
+          TARGET_STATUS: "In Review"
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const login = process.env.PROJECT_OWNER;
+            const number = parseInt(process.env.PROJECT_NUMBER, 10);
+            const target = process.env.TARGET_STATUS;
+            const pr = context.payload.pull_request;
+
+            // 1. Issues linked to this PR
+            const linked = await github.graphql(`
+              query($owner:String!, $repo:String!, $pr:Int!) {
+                repository(owner:$owner, name:$repo) {
+                  pullRequest(number:$pr) {
+                    closingIssuesReferences(first:50) {
+                      nodes { id number state }
+                    }
+                  }
+                }
+              }`, { owner: context.repo.owner, repo: context.repo.repo, pr: pr.number });
+            const issues = linked.repository.pullRequest.closingIssuesReferences.nodes
+              .filter(i => i.state === "OPEN");
+            if (issues.length === 0) {
+              core.info("No open linked issues. Nothing to do.");
+              return;
+            }
+
+            // 2. Project, Status field, and target option
+            const frag = `projectV2(number:$number) {
+              id
+              field(name:"Status") {
+                ... on ProjectV2SingleSelectField { id options { id name } }
+              }
+            }`;
+            const data = await github.graphql(`
+              query($login:String!, $number:Int!) {
+                repositoryOwner(login:$login) {
+                  ... on User { ${frag} }
+                  ... on Organization { ${frag} }
+                }
+              }`, { login, number });
+            const project = data.repositoryOwner.projectV2;
+            if (!project) core.setFailed(`Project ${number} not found for ${login}`);
+            const option = project.field.options.find(o => o.name === target);
+            if (!option) core.setFailed(`Status option "${target}" not found`);
+
+            // 3. Update each linked issue's project item
+            for (const issue of issues) {
+              const r = await github.graphql(`
+                query($id:ID!) {
+                  node(id:$id) {
+                    ... on Issue { projectItems(first:50) { nodes { id project { id } } } }
+                  }
+                }`, { id: issue.id });
+              let itemId = r.node.projectItems.nodes
+                .find(n => n.project.id === project.id)?.id;
+
+              if (!itemId) {
+                const add = await github.graphql(`
+                  mutation($project:ID!, $content:ID!) {
+                    addProjectV2ItemById(input:{projectId:$project, contentId:$content}) {
+                      item { id }
+                    }
+                  }`, { project: project.id, content: issue.id });
+                itemId = add.addProjectV2ItemById.item.id;
+              }
+
+              await github.graphql(`
+                mutation($project:ID!, $item:ID!, $field:ID!, $option:String!) {
+                  updateProjectV2ItemFieldValue(input:{
+                    projectId:$project, itemId:$item, fieldId:$field,
+                    value:{ singleSelectOptionId:$option }
+                  }) { projectV2Item { id } }
+                }`, { project: project.id, item: itemId, field: project.field.id, option: option.id });
+
+              core.info(`Issue #${issue.number} moved to ${target}`);
+            }
