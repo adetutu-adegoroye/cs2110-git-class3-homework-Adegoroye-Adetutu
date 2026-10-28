@@ -8,3 +8,5 @@ Starter webpage for the independent homework assignment on branches, pull reques
 Favorite Git Command: git bisect
 
 
+
+Automation test 2
